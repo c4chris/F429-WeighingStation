@@ -23,7 +23,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
+#include <string.h>
+#include "stm32f429i_discovery_lcd.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -60,7 +62,8 @@ SDRAM_HandleTypeDef hsdram1;
 osThreadId defaultTaskHandle;
 osThreadId grabI2CTaskHandle;
 /* USER CODE BEGIN PV */
-
+uint8_t dataBuf[2];
+uint8_t bridgeValue[2];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -687,7 +690,22 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+	if (GPIO_Pin == B1_Pin)
+	{
+		HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
+	}
+}
 
+void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+	if (hi2c == &hi2c3)
+	{
+		HAL_GPIO_TogglePin(LD4_GPIO_Port, LD4_Pin);
+		memcpy(bridgeValue,dataBuf,2);
+	}
+}
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -699,13 +717,40 @@ static void MX_GPIO_Init(void)
 /* USER CODE END Header_StartDefaultTask */
 void StartDefaultTask(void const * argument)
 {
-  /* USER CODE BEGIN 5 */
+	/* USER CODE BEGIN 5 */
+	BSP_LCD_Init();
+	/* Initialize the LCD Layers */
+	BSP_LCD_LayerDefaultInit(1, LCD_FRAME_BUFFER);
+	/* Set LCD Foreground Layer  */
+	BSP_LCD_SelectLayer(1);
+	BSP_LCD_SetFont(&LCD_DEFAULT_FONT);
+	/* Clear the LCD */
+	BSP_LCD_SetBackColor(LCD_COLOR_BLACK);
+	BSP_LCD_Clear(LCD_COLOR_BLACK);
+	/* Set the LCD Text Color */
+	BSP_LCD_SetTextColor(LCD_COLOR_GREEN);
+
+	/* Display LCD messages */
+	BSP_LCD_DisplayStringAt(0, 10, (uint8_t*)"STM32F429I BSP", CENTER_MODE);
+	BSP_LCD_SetFont(&Font16);
+	BSP_LCD_DisplayStringAt(0, 35, (uint8_t*)"Display ADC3 (F6)", CENTER_MODE);
+	BSP_LCD_SetFont(&Font20);
+	HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_SET);
   /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END 5 */
+	for(;;)
+	{
+		uint8_t msg[50];
+		sprintf((char *)msg,"%02x %02x",bridgeValue[0],bridgeValue[1]);
+		BSP_LCD_DisplayStringAt(0, BSP_LCD_GetYSize()/2 + 35, msg, CENTER_MODE);
+		uint32_t weight = (bridgeValue[0] & 0x3f) * 256 + bridgeValue[1];
+		weight -= 1000;
+		weight *= 5000;
+		weight /= 14000;
+		sprintf((char *)msg,"bridge: %2d.%02d kg", (uint16_t)(weight / 100), (uint16_t)(weight % 100));
+		BSP_LCD_DisplayStringAt(0, BSP_LCD_GetYSize()/2 + 55, msg, CENTER_MODE);
+		osDelay(200);
+	}
+	/* USER CODE END 5 */
 }
 
 /* USER CODE BEGIN Header_StartTaskI2C */
@@ -717,13 +762,21 @@ void StartDefaultTask(void const * argument)
 /* USER CODE END Header_StartTaskI2C */
 void StartTaskI2C(void const * argument)
 {
-  /* USER CODE BEGIN StartTaskI2C */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END StartTaskI2C */
+	/* USER CODE BEGIN StartTaskI2C */
+	uint8_t addrBuf[1];
+	addrBuf[0] = 0x07;
+	memset(bridgeValue,0,2);
+	/* Power up load cell */
+	HAL_GPIO_WritePin(GPIOC, Sensor_PWR_Pin, GPIO_PIN_SET);
+	/* Infinite loop */
+	for(;;)
+	{
+		HAL_I2C_Master_Transmit_DMA(&hi2c3, 0x28 << 1, addrBuf, 0);
+		osDelay(100);
+		HAL_I2C_Master_Receive_DMA(&hi2c3, (0x28 << 1) | 1, dataBuf, 2);
+		osDelay(100);
+	}
+	/* USER CODE END StartTaskI2C */
 }
 
 /**
@@ -739,12 +792,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   /* USER CODE BEGIN Callback 0 */
 
   /* USER CODE END Callback 0 */
-  if (htim->Instance == TIM6) {
-    HAL_IncTick();
-  }
-  /* USER CODE BEGIN Callback 1 */
+	if (htim->Instance == TIM6) {
+		HAL_IncTick();
+	}
+	/* USER CODE BEGIN Callback 1 */
 
-  /* USER CODE END Callback 1 */
+	/* USER CODE END Callback 1 */
 }
 
 /**
