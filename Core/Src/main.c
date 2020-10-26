@@ -62,8 +62,10 @@ SDRAM_HandleTypeDef hsdram1;
 osThreadId defaultTaskHandle;
 osThreadId grabI2CTaskHandle;
 /* USER CODE BEGIN PV */
-uint8_t dataBuf[2];
-uint8_t bridgeValue[2];
+uint8_t bridgeValue[4];
+uint16_t counts;
+uint16_t errs;
+uint8_t whoami;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -698,6 +700,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 	}
 }
 
+#if 0
 void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef *hi2c)
 {
 	if (hi2c == &hi2c3)
@@ -706,6 +709,7 @@ void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef *hi2c)
 		memcpy(bridgeValue,dataBuf,2);
 	}
 }
+#endif
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -717,6 +721,8 @@ void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef *hi2c)
 /* USER CODE END Header_StartDefaultTask */
 void StartDefaultTask(void const * argument)
 {
+	const uint32_t low = 950;
+	uint16_t c = 0;
 	/* USER CODE BEGIN 5 */
 	BSP_LCD_Init();
 	/* Initialize the LCD Layers */
@@ -733,22 +739,30 @@ void StartDefaultTask(void const * argument)
 	/* Display LCD messages */
 	BSP_LCD_DisplayStringAt(0, 10, (uint8_t*)"STM32F429I BSP", CENTER_MODE);
 	BSP_LCD_SetFont(&Font16);
-	BSP_LCD_DisplayStringAt(0, 35, (uint8_t*)"Display ADC3 (F6)", CENTER_MODE);
+	BSP_LCD_DisplayStringAt(0, 35, (uint8_t*)"Weighing Station", CENTER_MODE);
 	BSP_LCD_SetFont(&Font20);
 	HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_SET);
   /* Infinite loop */
 	for(;;)
 	{
 		uint8_t msg[50];
-		sprintf((char *)msg,"%02x %02x",bridgeValue[0],bridgeValue[1]);
+		sprintf((char *)msg,"%u %u %u %02x",c,errs,counts,whoami);
+		BSP_LCD_DisplayStringAt(0, BSP_LCD_GetYSize()/2, msg, CENTER_MODE);
+		sprintf((char *)msg,"%02x %02x %02x %02x",bridgeValue[0],bridgeValue[1],bridgeValue[2],bridgeValue[3]);
 		BSP_LCD_DisplayStringAt(0, BSP_LCD_GetYSize()/2 + 35, msg, CENTER_MODE);
 		uint32_t weight = (bridgeValue[0] & 0x3f) * 256 + bridgeValue[1];
-		weight -= 1000;
+		sprintf((char *)msg,"  raw : %ld  ", weight);
+		BSP_LCD_DisplayStringAt(0, BSP_LCD_GetYSize()/2 + 75, msg, CENTER_MODE);
+		if (weight < low)
+			weight = 0;
+		else
+			weight -= low;
 		weight *= 5000;
 		weight /= 14000;
-		sprintf((char *)msg,"bridge: %2d.%02d kg", (uint16_t)(weight / 100), (uint16_t)(weight % 100));
+		sprintf((char *)msg,"W: %2d.%02d kg", (uint16_t)(weight / 100), (uint16_t)(weight % 100));
 		BSP_LCD_DisplayStringAt(0, BSP_LCD_GetYSize()/2 + 55, msg, CENTER_MODE);
 		osDelay(200);
+		c += 1;
 	}
 	/* USER CODE END 5 */
 }
@@ -763,17 +777,27 @@ void StartDefaultTask(void const * argument)
 void StartTaskI2C(void const * argument)
 {
 	/* USER CODE BEGIN StartTaskI2C */
-	uint8_t addrBuf[1];
-	addrBuf[0] = 0x07;
+	const uint32_t I2C_Timeout = I2Cx_TIMEOUT_MAX;
+	const uint8_t dev = 0x28 << 1;
+	HAL_StatusTypeDef res;
+	whoami = 0;
+	counts = 0;
+	errs = 0;
 	memset(bridgeValue,0,2);
+	uint8_t dataBuf[4];
 	/* Power up load cell */
 	HAL_GPIO_WritePin(GPIOC, Sensor_PWR_Pin, GPIO_PIN_SET);
 	/* Infinite loop */
 	for(;;)
 	{
-		HAL_I2C_Master_Transmit_DMA(&hi2c3, 0x28 << 1, addrBuf, 0);
-		osDelay(100);
-		HAL_I2C_Master_Receive_DMA(&hi2c3, (0x28 << 1) | 1, dataBuf, 2);
+		res = HAL_I2C_Master_Receive(&hi2c3, dev | 1, dataBuf, 4, I2C_Timeout);
+		if (res != HAL_OK)
+			errs += 1;
+		else
+		{
+			counts += 1;
+			memcpy(bridgeValue, dataBuf, 4);
+		}
 		osDelay(100);
 	}
 	/* USER CODE END StartTaskI2C */
