@@ -63,8 +63,10 @@ osThreadId defaultTaskHandle;
 osThreadId grabI2CTaskHandle;
 /* USER CODE BEGIN PV */
 uint8_t bridgeValue[4];
+uint8_t response[3];
 uint16_t counts;
 uint16_t errs;
+uint16_t stale;
 uint8_t whoami;
 /* USER CODE END PV */
 
@@ -746,7 +748,9 @@ void StartDefaultTask(void const * argument)
 	for(;;)
 	{
 		uint8_t msg[50];
-		sprintf((char *)msg,"%u %u %u %02x",c,errs,counts,whoami);
+		sprintf((char *)msg,"%02x %02x %02x",response[0],response[1],response[2]);
+		BSP_LCD_DisplayStringAt(0, BSP_LCD_GetYSize()/2 - 35, msg, CENTER_MODE);
+		sprintf((char *)msg,"%u %u %u %u",c,errs,counts,stale);
 		BSP_LCD_DisplayStringAt(0, BSP_LCD_GetYSize()/2, msg, CENTER_MODE);
 		sprintf((char *)msg,"%02x %02x %02x %02x",bridgeValue[0],bridgeValue[1],bridgeValue[2],bridgeValue[3]);
 		BSP_LCD_DisplayStringAt(0, BSP_LCD_GetYSize()/2 + 35, msg, CENTER_MODE);
@@ -761,6 +765,12 @@ void StartDefaultTask(void const * argument)
 		weight /= 14000;
 		sprintf((char *)msg,"W: %2d.%02d kg", (uint16_t)(weight / 100), (uint16_t)(weight % 100));
 		BSP_LCD_DisplayStringAt(0, BSP_LCD_GetYSize()/2 + 55, msg, CENTER_MODE);
+		uint32_t temp = (bridgeValue[2] << 3) + (bridgeValue[3] >> 5);
+		temp *= 10;
+		temp /= 6; // just a guess at this point...
+		temp -= 1000;
+		sprintf((char *)msg,"  T: %2d.%01d C  ", (uint16_t)(temp / 10), (uint16_t)(temp % 10));
+		BSP_LCD_DisplayStringAt(0, BSP_LCD_GetYSize()/2 + 95, msg, CENTER_MODE);
 		osDelay(200);
 		c += 1;
 	}
@@ -773,6 +783,41 @@ void StartDefaultTask(void const * argument)
 * @param argument: Not used
 * @retval None
 */
+/*
+	* Status Bits (2 MSB of Output Data Packet) Definition
+	* 00 - Normal Operation. Good Data Packet
+	* 01 - Reserved
+	* 10 - Stale Data. Data has been fetched since last measurement cycle.
+	* 11 - Fault Detected
+*/
+/*
+ *   | Action            | Byte 1            |  Byte 2   |   Byte 3    |  Byte 4    | Notes
+ * --+-------------------+-------------------+-----------+-------------+------------+-------------------------
+ *   | Put sensor into   | [7 bit address *] |           |             |            | Data must be
+ * 1 | command mode      |        +          |   0xA0    |    0x00     |   0x00     | sent within 6ms
+ *   |                   | [Write bit = 0]   |           |             |            | of power up
+ * --+-------------------+-------------------+-----------+-------------+------------+-------------------------
+ *   | Command to read   | [7 bit address *] |           |             |            |
+ * 2 | EEPROM word 02    |        +          |   0x02    |    0x00     |   0x00     |
+ *   | from sensor       | [Write bit = 0]   |           |             |            |
+ * --+-------------------+-------------------+-----------+-------------+------------+-------------------------
+ *   | Fetch EEPROM      | [7 bit address *] |   0x5A    |   Word 02   |  Word 02   |
+ * 3 | word 02           |        +          | (response | [bits 15:8] | [bits 7:0] |
+ *   |                   | [Read bit = 1]    |  byte)    |             |            |
+ * --+-------------------+-------------------+-----------+-------------+------------+-------------------------
+ *   | Modify Word 02    |                   |           |             |            | Bits [9:3]: I2C address
+ * 4 | in user           |                   |           |             |            | required Bits [12:10]:
+ *   | software          |                   |           |             |            | 011 (communication lock)
+ * --+-------------------+-------------------+-----------+-------------+------------+-------------------------
+ *   | Write new version | [7 bit address *] |           |   Word 02   |  Word 02   |
+ * 5 | of Word 02 to     |        +          |   0x42    | [bits 15:8] | [bits 7:0] |
+ *   | sensor EEPROM     | [Write bit = 0]   |           |             |            |
+ * --+-------------------+-------------------+-----------+-------------+------------+-------------------------
+ *   | Exit command mode | [7 bit address *] |           |             |            |
+ * 6 | & start normal    |        +          |   0x80    |    0x00     |   0x00     |
+ *   | operating mode    | [Write bit = 0]   |           |             |            |
+ * --+-------------------+-------------------+-----------+-------------+------------+-------------------------
+ */
 /* USER CODE END Header_StartTaskI2C */
 void StartTaskI2C(void const * argument)
 {
@@ -786,7 +831,22 @@ void StartTaskI2C(void const * argument)
 	memset(bridgeValue,0,2);
 	uint8_t dataBuf[4];
 	/* Power up load cell */
+	dataBuf[0] = 0xA0;
+	dataBuf[1] = 0;
+	dataBuf[2] = 0;
 	HAL_GPIO_WritePin(GPIOC, Sensor_PWR_Pin, GPIO_PIN_SET);
+	HAL_Delay(3);
+	HAL_I2C_Master_Transmit(&hi2c3, dev, dataBuf, 3, I2C_Timeout);
+	dataBuf[0] = 2;
+	dataBuf[1] = 0;
+	dataBuf[2] = 0;
+	HAL_I2C_Master_Transmit(&hi2c3, dev, dataBuf, 3, I2C_Timeout);
+	memset(response, 0, 3);
+	HAL_I2C_Master_Receive(&hi2c3, dev | 1, response, 3, I2C_Timeout);
+	dataBuf[0] = 0x80;
+	dataBuf[1] = 0;
+	dataBuf[2] = 0;
+	HAL_I2C_Master_Transmit(&hi2c3, dev, dataBuf, 3, I2C_Timeout);
 	/* Infinite loop */
 	for(;;)
 	{
@@ -795,10 +855,15 @@ void StartTaskI2C(void const * argument)
 			errs += 1;
 		else
 		{
-			counts += 1;
-			memcpy(bridgeValue, dataBuf, 4);
+			uint8_t status = (dataBuf[0] >> 6) & 0x3;
+			if (status == 0)
+			{
+				counts += 1;
+				memcpy(bridgeValue, dataBuf, 4);
+			} else if (status == 2)
+				stale += 1;
 		}
-		osDelay(100);
+		osDelay(50);
 	}
 	/* USER CODE END StartTaskI2C */
 }
