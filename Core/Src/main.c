@@ -56,6 +56,8 @@ SPI_HandleTypeDef hspi5;
 TIM_HandleTypeDef htim1;
 
 UART_HandleTypeDef huart1;
+DMA_HandleTypeDef hdma_usart1_rx;
+DMA_HandleTypeDef hdma_usart1_tx;
 
 SDRAM_HandleTypeDef hsdram1;
 
@@ -68,6 +70,16 @@ uint16_t counts;
 uint16_t errs;
 uint16_t stale;
 uint8_t whoami;
+volatile unsigned int u1rc;
+volatile unsigned int u1hrc;
+volatile unsigned int u1tc;
+volatile unsigned int u1htc;
+volatile unsigned int u1ec;
+volatile unsigned int u1ic;
+unsigned char dbgBuf[256];
+unsigned char input[64];
+unsigned char u1tx[256];
+unsigned char u1rx[64];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -117,6 +129,11 @@ int main(void)
 
   /* USER CODE BEGIN SysInit */
 
+  // !!!!!  Make sure MX_DMA_Init(); comes before the UARTS here below...
+  // !!!!!  Get enough stack room for the tasks (set minimal stack size to 512 at this point)
+  // !!!!!  Watch out about interrupt priorities for DMA and/or UARTs ... ??? not sure what is the real deal there
+  //        but when 0 instead of 5 I get vTaskNotifyGiveFromISR freezing the system from the DMA completion callback...
+
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -155,7 +172,7 @@ int main(void)
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* definition and creation of grabI2CTask */
-  osThreadDef(grabI2CTask, StartTaskI2C, osPriorityLow, 0, 128);
+  osThreadDef(grabI2CTask, StartTaskI2C, osPriorityIdle, 0, 4096);
   grabI2CTaskHandle = osThreadCreate(osThread(grabI2CTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
@@ -526,6 +543,7 @@ static void MX_DMA_Init(void)
 
   /* DMA controller clock enable */
   __HAL_RCC_DMA1_CLK_ENABLE();
+  __HAL_RCC_DMA2_CLK_ENABLE();
 
   /* DMA interrupt init */
   /* DMA1_Stream2_IRQn interrupt configuration */
@@ -534,6 +552,12 @@ static void MX_DMA_Init(void)
   /* DMA1_Stream4_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Stream4_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream4_IRQn);
+  /* DMA2_Stream2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream2_IRQn);
+  /* DMA2_Stream7_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream7_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream7_IRQn);
 
 }
 
@@ -694,6 +718,45 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+	HAL_GPIO_TogglePin(LD4_GPIO_Port, LD4_Pin); // toggle red led
+
+	if (huart->Instance == USART1)
+	{
+		u1tc += 1;
+		/* Notify the task that the transmission is complete. */
+    vTaskNotifyGiveFromISR(grabI2CTaskHandle, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+	}
+}
+
+void HAL_UART_TxHalfCpltCallback(UART_HandleTypeDef *huart)
+{
+	if (huart->Instance == USART1)
+		u1htc += 1;
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+	if (huart->Instance == USART1)
+		u1rc += 1;
+}
+
+void HAL_UART_RxHalfCpltCallback(UART_HandleTypeDef *huart)
+{
+	if (huart->Instance == USART1)
+		u1hrc += 1;
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+	if (huart->Instance == USART1)
+		u1ec += 1;
+}
+
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
 	if (GPIO_Pin == B1_Pin)
@@ -712,6 +775,32 @@ void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef *hi2c)
 	}
 }
 #endif
+
+int UART_Receive(unsigned char *dest, const unsigned char *rx, UART_HandleTypeDef *huart, unsigned int *uxcc, const unsigned int max)
+{
+	unsigned int cc = __HAL_DMA_GET_COUNTER(huart->hdmarx);
+	if (*uxcc != cc)
+	{
+		HAL_UART_DMAPause(huart);
+  	int len = 0;
+		if (cc > *uxcc)
+		{
+			for (unsigned int i = max - *uxcc; i < max; i++)
+				dest[len++] = rx[i];
+			for (unsigned int i = 0; i < max - cc; i++)
+				dest[len++] = rx[i];
+		}
+		else
+		{
+			for (unsigned int i = max - *uxcc; i < max - cc; i++)
+				dest[len++] = rx[i];
+		}
+		HAL_UART_DMAResume(huart);
+  	*uxcc = cc;
+  	return len;
+	}
+	return 0;
+}
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -723,9 +812,9 @@ void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef *hi2c)
 /* USER CODE END Header_StartDefaultTask */
 void StartDefaultTask(void const * argument)
 {
+  /* USER CODE BEGIN 5 */
 	const uint32_t low = 950;
 	uint16_t c = 0;
-	/* USER CODE BEGIN 5 */
 	BSP_LCD_Init();
 	/* Initialize the LCD Layers */
 	BSP_LCD_LayerDefaultInit(1, LCD_FRAME_BUFFER);
@@ -774,7 +863,7 @@ void StartDefaultTask(void const * argument)
 		osDelay(200);
 		c += 1;
 	}
-	/* USER CODE END 5 */
+  /* USER CODE END 5 */
 }
 
 /* USER CODE BEGIN Header_StartTaskI2C */
@@ -821,14 +910,47 @@ void StartDefaultTask(void const * argument)
 /* USER CODE END Header_StartTaskI2C */
 void StartTaskI2C(void const * argument)
 {
-	/* USER CODE BEGIN StartTaskI2C */
+  /* USER CODE BEGIN StartTaskI2C */
+	const TickType_t xMaxBlockTime = pdMS_TO_TICKS( 200 );
+	uint32_t ulNotificationValue;
+	HAL_UART_Receive_DMA(&huart1, u1rx, 64);
+	unsigned int u1cc = __HAL_DMA_GET_COUNTER(huart1.hdmarx);
 	const uint32_t I2C_Timeout = I2Cx_TIMEOUT_MAX;
 	const uint8_t dev = 0x28 << 1;
 	HAL_StatusTypeDef res;
+	int inLen = 0;
 	whoami = 0;
 	counts = 0;
 	errs = 0;
 	memset(bridgeValue,0,2);
+	int len = snprintf((char *) dbgBuf, 256, "\r\nStarting with %02x\r\n", dev);
+	res = HAL_UART_Transmit_DMA(&huart1, dbgBuf, len);
+	ulNotificationValue = ulTaskNotifyTake(pdTRUE, xMaxBlockTime);
+	if (res != HAL_OK || ulNotificationValue != 1)
+	{
+		/* Something went wrong during output... */
+		//HAL_UART_DMAStop(&huart1);
+		errs += 8;
+		len = snprintf((char *) dbgBuf, 256, "Timeout waiting on the DMA completion for %u ticks - seems bad\r\n", 200);
+		HAL_UART_Transmit(&huart1, dbgBuf, len, xMaxBlockTime);
+	}
+	len = snprintf((char *) dbgBuf, 256, "u1rc = %u u1hrc = %u u1tc = %u u1htc = %u u1ec = %u u1ic = %u u1cc = %u\r\n# ", u1rc, u1hrc, u1tc, u1htc, u1ec, u1ic, u1cc);
+	u1tc = 0;
+	res = HAL_UART_Transmit_DMA(&huart1, dbgBuf, len);
+	ulNotificationValue = ulTaskNotifyTake(pdTRUE, xMaxBlockTime);
+	len = UART_Receive(input, u1rx, &huart1, &u1cc, 64);
+	if (len > 0)
+	{
+		inLen = len;
+		len = snprintf((char *) dbgBuf, 256, "%.*s", inLen, input);
+		res = HAL_UART_Transmit_DMA(&huart1, dbgBuf, len);
+		ulNotificationValue = ulTaskNotifyTake(pdTRUE, xMaxBlockTime);
+		if (res != HAL_OK || ulNotificationValue != 1)
+		{
+			errs += 2;
+			HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin); // toggle green led
+		}
+	}
 	uint8_t dataBuf[4];
 	/* Power up load cell */
 	dataBuf[0] = 0xA0;
@@ -863,9 +985,35 @@ void StartTaskI2C(void const * argument)
 			} else if (status == 2)
 				stale += 1;
 		}
+		len = UART_Receive(input + inLen, u1rx, &huart1, &u1cc, 64);
+		if (len > 0)
+		{
+			int l = len;
+			len = snprintf((char *) dbgBuf, 256, "%.*s", l, input + inLen);
+			inLen += l;
+			res = HAL_UART_Transmit_DMA(&huart1, dbgBuf, len);
+			ulNotificationValue = ulTaskNotifyTake(pdTRUE, xMaxBlockTime);
+			if (res != HAL_OK || ulNotificationValue != 1)
+			{
+				errs += 1;
+				HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin); // toggle green led
+			}
+			if (input[inLen - 1] == '\r')
+			{
+				len = snprintf((char *) dbgBuf, 256, "\nReceived command '%.*s'\r\n# ", inLen - 1, input);
+				inLen = 0;
+				res = HAL_UART_Transmit_DMA(&huart1, dbgBuf, len);
+				ulNotificationValue = ulTaskNotifyTake(pdTRUE, xMaxBlockTime);
+				if (res != HAL_OK || ulNotificationValue != 1)
+				{
+					errs += 1;
+					HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin); // toggle green led
+				}
+			}
+		}
 		osDelay(50);
 	}
-	/* USER CODE END StartTaskI2C */
+  /* USER CODE END StartTaskI2C */
 }
 
 /**
@@ -881,12 +1029,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   /* USER CODE BEGIN Callback 0 */
 
   /* USER CODE END Callback 0 */
-	if (htim->Instance == TIM6) {
-		HAL_IncTick();
-	}
-	/* USER CODE BEGIN Callback 1 */
+  if (htim->Instance == TIM6) {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
 
-	/* USER CODE END Callback 1 */
+  /* USER CODE END Callback 1 */
 }
 
 /**
