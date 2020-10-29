@@ -63,13 +63,15 @@ SDRAM_HandleTypeDef hsdram1;
 
 osThreadId defaultTaskHandle;
 osThreadId grabI2CTaskHandle;
+osThreadId readI2CTaskHandle;
 /* USER CODE BEGIN PV */
-uint8_t bridgeValue[4];
+uint8_t LCdev[4];
+uint8_t LCcnt;
+uint8_t bridgeValue[4 * 4];
 uint8_t response[3];
 uint16_t counts;
 uint16_t errs;
 uint16_t stale;
-uint8_t whoami;
 volatile unsigned int u1rc;
 volatile unsigned int u1hrc;
 volatile unsigned int u1tc;
@@ -95,6 +97,7 @@ static void MX_TIM1_Init(void);
 static void MX_USART1_UART_Init(void);
 void StartDefaultTask(void const * argument);
 void StartTaskI2C(void const * argument);
+void readI2C(void const * argument);
 
 /* USER CODE BEGIN PFP */
 
@@ -172,8 +175,12 @@ int main(void)
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* definition and creation of grabI2CTask */
-  osThreadDef(grabI2CTask, StartTaskI2C, osPriorityIdle, 0, 4096);
+  osThreadDef(grabI2CTask, StartTaskI2C, osPriorityIdle, 0, 512);
   grabI2CTaskHandle = osThreadCreate(osThread(grabI2CTask), NULL);
+
+  /* definition and creation of readI2CTask */
+  osThreadDef(readI2CTask, readI2C, osPriorityNormal, 0, 512);
+  readI2CTaskHandle = osThreadCreate(osThread(readI2CTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -919,7 +926,7 @@ void StartTaskI2C(void const * argument)
 	const uint8_t dev = 0x28 << 1;
 	HAL_StatusTypeDef res;
 	int inLen = 0;
-	whoami = 0;
+	int hb = 0;
 	counts = 0;
 	errs = 0;
 	memset(bridgeValue,0,2);
@@ -959,31 +966,71 @@ void StartTaskI2C(void const * argument)
 	HAL_GPIO_WritePin(GPIOC, Sensor_PWR_Pin, GPIO_PIN_SET);
 	HAL_Delay(3);
 	HAL_I2C_Master_Transmit(&hi2c3, dev, dataBuf, 3, I2C_Timeout);
-	dataBuf[0] = 2;
-	dataBuf[1] = 0;
-	dataBuf[2] = 0;
-	HAL_I2C_Master_Transmit(&hi2c3, dev, dataBuf, 3, I2C_Timeout);
-	memset(response, 0, 3);
-	HAL_I2C_Master_Receive(&hi2c3, dev | 1, response, 3, I2C_Timeout);
+	// Now see what we do with cell
+	for(;;)
+	{
+		dataBuf[0] = 2;
+		dataBuf[1] = 0;
+		dataBuf[2] = 0;
+		HAL_I2C_Master_Transmit(&hi2c3, dev, dataBuf, 3, I2C_Timeout);
+		memset(response, 0, 3);
+		HAL_I2C_Master_Receive(&hi2c3, dev | 1, response, 3, I2C_Timeout);
+		len = UART_Receive(input + inLen, u1rx, &huart1, &u1cc, 64);
+		if (len > 0)
+		{
+			int l = len;
+			len = snprintf((char *) dbgBuf, 256, "%.*s", l, input + inLen);
+			inLen += l;
+			res = HAL_UART_Transmit_DMA(&huart1, dbgBuf, len);
+			ulNotificationValue = ulTaskNotifyTake(pdTRUE, xMaxBlockTime);
+			if (res != HAL_OK || ulNotificationValue != 1)
+			{
+				errs += 1;
+				HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin); // toggle green led
+			}
+			if (input[inLen - 1] == '\r')
+			{
+				int cmdLen = inLen - 1;
+				len = snprintf((char *) dbgBuf, 256, "\nReceived command '%.*s'\r\n# ", cmdLen, input);
+				inLen = 0;
+				res = HAL_UART_Transmit_DMA(&huart1, dbgBuf, len);
+				ulNotificationValue = ulTaskNotifyTake(pdTRUE, xMaxBlockTime);
+				if (res != HAL_OK || ulNotificationValue != 1)
+				{
+					errs += 1;
+					HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin); // toggle green led
+				}
+				if (strncmp((char *) input, "done", cmdLen) == 0)
+				{
+					len = snprintf((char *) dbgBuf, 256, "\nSetup done - now releasing read task\r\n# ");
+					res = HAL_UART_Transmit_DMA(&huart1, dbgBuf, len);
+					ulNotificationValue = ulTaskNotifyTake(pdTRUE, xMaxBlockTime);
+					if (res != HAL_OK || ulNotificationValue != 1)
+					{
+						errs += 1;
+						HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin); // toggle green led
+					}
+					break;
+				}
+			}
+		}
+		osDelay(50);
+	}
 	dataBuf[0] = 0x80;
 	dataBuf[1] = 0;
 	dataBuf[2] = 0;
 	HAL_I2C_Master_Transmit(&hi2c3, dev, dataBuf, 3, I2C_Timeout);
+	// Indicate to the readI2C task that we are done
+	LCdev[0] = 0x28 << 1;
+	LCcnt = 1;
 	/* Infinite loop */
 	for(;;)
 	{
-		res = HAL_I2C_Master_Receive(&hi2c3, dev | 1, dataBuf, 4, I2C_Timeout);
-		if (res != HAL_OK)
-			errs += 1;
-		else
+		hb += 1;
+		if (hb > 20)
 		{
-			uint8_t status = (dataBuf[0] >> 6) & 0x3;
-			if (status == 0)
-			{
-				counts += 1;
-				memcpy(bridgeValue, dataBuf, 4);
-			} else if (status == 2)
-				stale += 1;
+			HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin); // toggle green led as heartbeat
+			hb = 0;
 		}
 		len = UART_Receive(input + inLen, u1rx, &huart1, &u1cc, 64);
 		if (len > 0)
@@ -1014,6 +1061,51 @@ void StartTaskI2C(void const * argument)
 		osDelay(50);
 	}
   /* USER CODE END StartTaskI2C */
+}
+
+/* USER CODE BEGIN Header_readI2C */
+/**
+* @brief Function implementing the readI2CTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_readI2C */
+void readI2C(void const * argument)
+{
+  /* USER CODE BEGIN readI2C */
+	const uint32_t I2C_Timeout = I2Cx_TIMEOUT_MAX;
+	HAL_StatusTypeDef res;
+	uint8_t dataBuf[4];
+	/* Infinite loop */
+	for(;;)
+	{
+		if (LCcnt > 0)
+		{
+			// all on the same bus... need to read sequentially
+			// maybe reorganize to send update request followed by actual read of data
+			//  currently alternates between stale and valid data
+			for (unsigned int i = 0; i < LCcnt; i++)
+			{
+				res = HAL_I2C_Master_Receive(&hi2c3, LCdev[i] | 1, dataBuf, 4, I2C_Timeout);
+				if (res != HAL_OK)
+					errs += 1;
+				else
+				{
+					uint8_t status = (dataBuf[0] >> 6) & 0x3;
+					if (status == 0)
+					{
+						counts += 1;
+						memcpy(bridgeValue + i * 4, dataBuf, 4);
+					} else if (status == 2)
+						stale += 1;
+				}
+			}
+			osDelay(50);
+		}
+		else
+			osDelay(1000);
+	}
+  /* USER CODE END readI2C */
 }
 
 /**
