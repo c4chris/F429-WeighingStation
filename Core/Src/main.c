@@ -24,6 +24,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include "stm32f429i_discovery_lcd.h"
 /* USER CODE END Includes */
@@ -100,7 +101,8 @@ void StartTaskI2C(void const * argument);
 void readI2C(void const * argument);
 
 /* USER CODE BEGIN PFP */
-
+void my_printf(char *format, ...)
+	_ATTRIBUTE ((__format__ (__printf__, 1, 2)));
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -808,6 +810,28 @@ int UART_Receive(unsigned char *dest, const unsigned char *rx, UART_HandleTypeDe
 	}
 	return 0;
 }
+
+void my_printf(char *format, ...)
+{
+	va_list args;
+	const TickType_t xMaxBlockTime = pdMS_TO_TICKS( 200 );
+	uint32_t ulNotificationValue;
+	HAL_StatusTypeDef res;
+	va_start(args, format);
+	int len = vsniprintf((char *) dbgBuf, 256, format, args);
+	va_end(args);
+	res = HAL_UART_Transmit_DMA(&huart1, dbgBuf, len);
+	ulNotificationValue = ulTaskNotifyTake(pdTRUE, xMaxBlockTime);
+	if (res != HAL_OK || ulNotificationValue != 1)
+	{
+		/* Something went wrong during output... */
+		//HAL_UART_DMAStop(&huart1);
+		errs += 8;
+		HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin); // toggle green led
+		len = snprintf((char *) dbgBuf, 256, "Timeout waiting on the DMA completion for %u ticks - seems bad\r\n", 200);
+		HAL_UART_Transmit(&huart1, dbgBuf, len, xMaxBlockTime);
+	}
+}
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -918,46 +942,17 @@ void StartDefaultTask(void const * argument)
 void StartTaskI2C(void const * argument)
 {
   /* USER CODE BEGIN StartTaskI2C */
-	const TickType_t xMaxBlockTime = pdMS_TO_TICKS( 200 );
-	uint32_t ulNotificationValue;
 	HAL_UART_Receive_DMA(&huart1, u1rx, 64);
 	unsigned int u1cc = __HAL_DMA_GET_COUNTER(huart1.hdmarx);
 	const uint32_t I2C_Timeout = I2Cx_TIMEOUT_MAX;
 	const uint8_t dev = 0x28 << 1;
-	HAL_StatusTypeDef res;
+	//HAL_StatusTypeDef res;
 	int inLen = 0;
 	int hb = 0;
 	counts = 0;
 	errs = 0;
 	memset(bridgeValue,0,2);
-	int len = snprintf((char *) dbgBuf, 256, "\r\nStarting with %02x\r\n", dev);
-	res = HAL_UART_Transmit_DMA(&huart1, dbgBuf, len);
-	ulNotificationValue = ulTaskNotifyTake(pdTRUE, xMaxBlockTime);
-	if (res != HAL_OK || ulNotificationValue != 1)
-	{
-		/* Something went wrong during output... */
-		//HAL_UART_DMAStop(&huart1);
-		errs += 8;
-		len = snprintf((char *) dbgBuf, 256, "Timeout waiting on the DMA completion for %u ticks - seems bad\r\n", 200);
-		HAL_UART_Transmit(&huart1, dbgBuf, len, xMaxBlockTime);
-	}
-	len = snprintf((char *) dbgBuf, 256, "u1rc = %u u1hrc = %u u1tc = %u u1htc = %u u1ec = %u u1ic = %u u1cc = %u\r\n# ", u1rc, u1hrc, u1tc, u1htc, u1ec, u1ic, u1cc);
-	u1tc = 0;
-	res = HAL_UART_Transmit_DMA(&huart1, dbgBuf, len);
-	ulNotificationValue = ulTaskNotifyTake(pdTRUE, xMaxBlockTime);
-	len = UART_Receive(input, u1rx, &huart1, &u1cc, 64);
-	if (len > 0)
-	{
-		inLen = len;
-		len = snprintf((char *) dbgBuf, 256, "%.*s", inLen, input);
-		res = HAL_UART_Transmit_DMA(&huart1, dbgBuf, len);
-		ulNotificationValue = ulTaskNotifyTake(pdTRUE, xMaxBlockTime);
-		if (res != HAL_OK || ulNotificationValue != 1)
-		{
-			errs += 2;
-			HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin); // toggle green led
-		}
-	}
+	my_printf("\r\nStarting with %02x\r\n", dev);
 	uint8_t dataBuf[4];
 	/* Power up load cell */
 	dataBuf[0] = 0xA0;
@@ -975,41 +970,21 @@ void StartTaskI2C(void const * argument)
 		HAL_I2C_Master_Transmit(&hi2c3, dev, dataBuf, 3, I2C_Timeout);
 		memset(response, 0, 3);
 		HAL_I2C_Master_Receive(&hi2c3, dev | 1, response, 3, I2C_Timeout);
-		len = UART_Receive(input + inLen, u1rx, &huart1, &u1cc, 64);
+		int len = UART_Receive(input + inLen, u1rx, &huart1, &u1cc, 64);
 		if (len > 0)
 		{
-			int l = len;
-			len = snprintf((char *) dbgBuf, 256, "%.*s", l, input + inLen);
-			inLen += l;
-			res = HAL_UART_Transmit_DMA(&huart1, dbgBuf, len);
-			ulNotificationValue = ulTaskNotifyTake(pdTRUE, xMaxBlockTime);
-			if (res != HAL_OK || ulNotificationValue != 1)
-			{
-				errs += 1;
-				HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin); // toggle green led
-			}
+			my_printf("%.*s", len, input + inLen);
+			inLen += len;
 			if (input[inLen - 1] == '\r')
 			{
 				int cmdLen = inLen - 1;
-				len = snprintf((char *) dbgBuf, 256, "\nReceived command '%.*s'\r\n# ", cmdLen, input);
+				my_printf("\nReceived command '%.*s'\r\n# ", cmdLen, input);
 				inLen = 0;
-				res = HAL_UART_Transmit_DMA(&huart1, dbgBuf, len);
-				ulNotificationValue = ulTaskNotifyTake(pdTRUE, xMaxBlockTime);
-				if (res != HAL_OK || ulNotificationValue != 1)
-				{
-					errs += 1;
-					HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin); // toggle green led
-				}
+				if (strncmp((char *) input, "UART", cmdLen) == 0)
+					my_printf("u1rc = %u u1hrc = %u u1tc = %u u1htc = %u u1ec = %u u1ic = %u u1cc = %u\r\n# ", u1rc, u1hrc, u1tc, u1htc, u1ec, u1ic, u1cc);
 				if (strncmp((char *) input, "done", cmdLen) == 0)
 				{
-					len = snprintf((char *) dbgBuf, 256, "\nSetup done - now releasing read task\r\n# ");
-					res = HAL_UART_Transmit_DMA(&huart1, dbgBuf, len);
-					ulNotificationValue = ulTaskNotifyTake(pdTRUE, xMaxBlockTime);
-					if (res != HAL_OK || ulNotificationValue != 1)
-					{
-						errs += 1;
-						HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin); // toggle green led
-					}
+					my_printf("\nSetup done - now releasing read task\r\n# ");
 					break;
 				}
 			}
@@ -1032,30 +1007,18 @@ void StartTaskI2C(void const * argument)
 			HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin); // toggle green led as heartbeat
 			hb = 0;
 		}
-		len = UART_Receive(input + inLen, u1rx, &huart1, &u1cc, 64);
+		int len = UART_Receive(input + inLen, u1rx, &huart1, &u1cc, 64);
 		if (len > 0)
 		{
-			int l = len;
-			len = snprintf((char *) dbgBuf, 256, "%.*s", l, input + inLen);
-			inLen += l;
-			res = HAL_UART_Transmit_DMA(&huart1, dbgBuf, len);
-			ulNotificationValue = ulTaskNotifyTake(pdTRUE, xMaxBlockTime);
-			if (res != HAL_OK || ulNotificationValue != 1)
-			{
-				errs += 1;
-				HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin); // toggle green led
-			}
+			my_printf("%.*s", len, input + inLen);
+			inLen += len;
 			if (input[inLen - 1] == '\r')
 			{
-				len = snprintf((char *) dbgBuf, 256, "\nReceived command '%.*s'\r\n# ", inLen - 1, input);
+				int cmdLen = inLen - 1;
+				my_printf("\nReceived command '%.*s'\r\n# ", cmdLen, input);
 				inLen = 0;
-				res = HAL_UART_Transmit_DMA(&huart1, dbgBuf, len);
-				ulNotificationValue = ulTaskNotifyTake(pdTRUE, xMaxBlockTime);
-				if (res != HAL_OK || ulNotificationValue != 1)
-				{
-					errs += 1;
-					HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin); // toggle green led
-				}
+				if (strncmp((char *) input, "UART", cmdLen) == 0)
+					my_printf("u1rc = %u u1hrc = %u u1tc = %u u1htc = %u u1ec = %u u1ic = %u u1cc = %u\r\n# ", u1rc, u1hrc, u1tc, u1htc, u1ec, u1ic, u1cc);
 			}
 		}
 		osDelay(50);
