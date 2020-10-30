@@ -69,7 +69,6 @@ osThreadId readI2CTaskHandle;
 uint8_t LCdev[4];
 uint8_t LCcnt;
 uint8_t bridgeValue[4 * 4];
-uint8_t response[3];
 uint16_t counts;
 uint16_t errs;
 uint16_t stale;
@@ -868,8 +867,6 @@ void StartDefaultTask(void const * argument)
 	for(;;)
 	{
 		uint8_t msg[50];
-		sprintf((char *)msg,"%02x %02x %02x",response[0],response[1],response[2]);
-		BSP_LCD_DisplayStringAt(0, BSP_LCD_GetYSize()/2 - 35, msg, CENTER_MODE);
 		sprintf((char *)msg,"%u %u %u %u",c,errs,counts,stale);
 		BSP_LCD_DisplayStringAt(0, BSP_LCD_GetYSize()/2, msg, CENTER_MODE);
 		sprintf((char *)msg,"%02x %02x %02x %02x",bridgeValue[0],bridgeValue[1],bridgeValue[2],bridgeValue[3]);
@@ -938,6 +935,16 @@ void StartDefaultTask(void const * argument)
  *   | operating mode    | [Write bit = 0]   |           |             |            |
  * --+-------------------+-------------------+-----------+-------------+------------+-------------------------
  */
+/*
+ * I2C Address
+ * Code Device Address (hex)
+ *  X    Analog Output*
+ *  0    0x28*
+ *  1    0x36
+ *  2    0x46
+ *  3    0x48
+ *  4    0x51
+ */
 /* USER CODE END Header_StartTaskI2C */
 void StartTaskI2C(void const * argument)
 {
@@ -945,31 +952,20 @@ void StartTaskI2C(void const * argument)
 	HAL_UART_Receive_DMA(&huart1, u1rx, 64);
 	unsigned int u1cc = __HAL_DMA_GET_COUNTER(huart1.hdmarx);
 	const uint32_t I2C_Timeout = I2Cx_TIMEOUT_MAX;
-	const uint8_t dev = 0x28 << 1;
-	//HAL_StatusTypeDef res;
+	const int nbAddress = 5;
+	const uint8_t address[5] = { 0x28, 0x36, 0x46, 0x48, 0x51 };
+	uint8_t detected = 0;
+	uint8_t counted = 0;
+	uint8_t dataBuf[4];
 	int inLen = 0;
 	int hb = 0;
 	counts = 0;
 	errs = 0;
 	memset(bridgeValue,0,2);
-	my_printf("\r\nStarting with %02x\r\n", dev);
-	uint8_t dataBuf[4];
-	/* Power up load cell */
-	dataBuf[0] = 0xA0;
-	dataBuf[1] = 0;
-	dataBuf[2] = 0;
-	HAL_GPIO_WritePin(GPIOC, Sensor_PWR_Pin, GPIO_PIN_SET);
-	HAL_Delay(3);
-	HAL_I2C_Master_Transmit(&hi2c3, dev, dataBuf, 3, I2C_Timeout);
+	my_printf("\r\nStarting Run on %s\r\n# ", tskKERNEL_VERSION_NUMBER);
 	// Now see what we do with cell
 	for(;;)
 	{
-		dataBuf[0] = 2;
-		dataBuf[1] = 0;
-		dataBuf[2] = 0;
-		HAL_I2C_Master_Transmit(&hi2c3, dev, dataBuf, 3, I2C_Timeout);
-		memset(response, 0, 3);
-		HAL_I2C_Master_Receive(&hi2c3, dev | 1, response, 3, I2C_Timeout);
 		int len = UART_Receive(input + inLen, u1rx, &huart1, &u1cc, 64);
 		if (len > 0)
 		{
@@ -978,26 +974,72 @@ void StartTaskI2C(void const * argument)
 			if (input[inLen - 1] == '\r')
 			{
 				int cmdLen = inLen - 1;
-				my_printf("\nReceived command '%.*s'\r\n# ", cmdLen, input);
+				my_printf("\nReceived command '%.*s'\r\n", cmdLen, input);
 				inLen = 0;
 				if (strncmp((char *) input, "UART", cmdLen) == 0)
 					my_printf("u1rc = %u u1hrc = %u u1tc = %u u1htc = %u u1ec = %u u1ic = %u u1cc = %u\r\n# ", u1rc, u1hrc, u1tc, u1htc, u1ec, u1ic, u1cc);
-				if (strncmp((char *) input, "done", cmdLen) == 0)
+				else if (strncmp((char *) input, "done", cmdLen) == 0)
 				{
 					my_printf("\nSetup done - now releasing read task\r\n# ");
+					HAL_GPIO_WritePin(GPIOC, Sensor_PWR_Pin, GPIO_PIN_SET);
+					HAL_Delay(10);
+					// Indicate to the readI2C task that we are done
+					if (counted == 0)
+					{
+						LCdev[0] = 0x28 << 1;
+						LCcnt = 1;
+					}
+					else
+						LCcnt = counted;
 					break;
 				}
+				else if (strncmp((char *) input, "scan", cmdLen) == 0)
+				{
+					/* Power up load cell and detect it */
+					detected = 0;
+					counted = 0;
+					for (unsigned int i = 0; i < nbAddress; i++)
+					{
+						uint8_t d = address[i] << 1;
+						dataBuf[0] = 0xA0;
+						dataBuf[1] = 0;
+						dataBuf[2] = 0;
+						HAL_GPIO_WritePin(GPIOC, Sensor_PWR_Pin, GPIO_PIN_SET);
+						HAL_Delay(3);
+						HAL_I2C_Master_Transmit(&hi2c3, d, dataBuf, 3, I2C_Timeout);
+						dataBuf[0] = 2;
+						dataBuf[1] = 0;
+						dataBuf[2] = 0;
+						HAL_I2C_Master_Transmit(&hi2c3, d, dataBuf, 3, I2C_Timeout);
+						memset(dataBuf, 0, 3);
+						HAL_StatusTypeDef res = HAL_I2C_Master_Receive(&hi2c3, d | 1, dataBuf, 3, I2C_Timeout);
+						HAL_GPIO_WritePin(GPIOC, Sensor_PWR_Pin, GPIO_PIN_RESET);
+						if (res == HAL_OK && dataBuf[0] == 0x5A)
+						{
+							uint8_t a = (dataBuf[1] >> 2) & 3;
+							uint8_t b = ((dataBuf[1] & 3) << 5) | (dataBuf[2] >> 3);
+							my_printf("Scan 0x%02X - received 0x%02X 0x%02X 0x%02X => %u 0x%02X\r\n", address[i], dataBuf[0], dataBuf[1], dataBuf[2], a, b);
+							detected |= 1 << i;
+							LCdev[counted++] = d;
+						} else {
+							my_printf("Scan 0x%02X - empty\r\n", address[i]);
+						}
+						HAL_Delay(10);
+					}
+					my_printf("Scan completed - found %u device%s - flags 0x%02X\r\n# ", counted, counted > 1 ? "s" : "", detected);
+				}
+				else
+					my_printf("Unknown command\r\n# ");
 			}
 		}
 		osDelay(50);
 	}
+#if 0
 	dataBuf[0] = 0x80;
 	dataBuf[1] = 0;
 	dataBuf[2] = 0;
 	HAL_I2C_Master_Transmit(&hi2c3, dev, dataBuf, 3, I2C_Timeout);
-	// Indicate to the readI2C task that we are done
-	LCdev[0] = 0x28 << 1;
-	LCcnt = 1;
+#endif
 	/* Infinite loop */
 	for(;;)
 	{
