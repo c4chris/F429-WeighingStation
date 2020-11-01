@@ -102,6 +102,7 @@ void readI2C(void const * argument);
 /* USER CODE BEGIN PFP */
 void my_printf(char *format, ...)
 	_ATTRIBUTE ((__format__ (__printf__, 1, 2)));
+HAL_StatusTypeDef powerup_and_read(I2C_HandleTypeDef *h, uint8_t d, uint8_t *dataBuf, const uint32_t I2C_Timeout);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -831,6 +832,27 @@ void my_printf(char *format, ...)
 		HAL_UART_Transmit(&huart1, dbgBuf, len, xMaxBlockTime);
 	}
 }
+
+HAL_StatusTypeDef read_cell(I2C_HandleTypeDef *h, uint8_t d, uint8_t a, uint8_t *dataBuf, const uint32_t I2C_Timeout)
+{
+	dataBuf[0] = a;
+	dataBuf[1] = 0;
+	dataBuf[2] = 0;
+	HAL_I2C_Master_Transmit(h, d, dataBuf, 3, I2C_Timeout);
+	memset(dataBuf, 0, 3);
+	return HAL_I2C_Master_Receive(h, d | 1, dataBuf, 3, I2C_Timeout);
+}
+
+HAL_StatusTypeDef powerup_and_read(I2C_HandleTypeDef *h, uint8_t d, uint8_t *dataBuf, const uint32_t I2C_Timeout)
+{
+	dataBuf[0] = 0xA0;
+	dataBuf[1] = 0;
+	dataBuf[2] = 0;
+	HAL_GPIO_WritePin(GPIOC, Sensor_PWR_Pin, GPIO_PIN_SET);
+	HAL_Delay(3);
+	HAL_I2C_Master_Transmit(h, d, dataBuf, 3, I2C_Timeout);
+	return read_cell(h, d, 2, dataBuf, I2C_Timeout);
+}
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -882,10 +904,22 @@ void StartDefaultTask(void const * argument)
 		weight /= 14000;
 		sprintf((char *)msg,"W: %2d.%02d kg", (uint16_t)(weight / 100), (uint16_t)(weight % 100));
 		BSP_LCD_DisplayStringAt(0, BSP_LCD_GetYSize()/2 + 55, msg, CENTER_MODE);
+		// Try this : Temperature = (Counts x 200 / 2048) - 50
+		/*
+		 * Temperature Output vs Counts
+		 * Output oC  Digital Counts (decimal)  Digital  Counts (hex)
+		 *   -50                0                    0 x 0000
+		 *     0              512                    0 X 0200
+		 *    10              614                    0 X 0266
+		 *    25              767                    0 X 02FF
+		 *    40              921                    0 X 0399
+		 *    85             1381                    0 X 0565
+		 *   150             2047                    0 X 07FF
+		 */
 		uint32_t temp = (bridgeValue[2] << 3) + (bridgeValue[3] >> 5);
-		temp *= 10;
-		temp /= 6; // just a guess at this point...
-		temp -= 1000;
+		temp *= 2000;
+		temp /= 2048; // just a guess at this point...
+		temp -= 50;
 		sprintf((char *)msg,"  T: %2d.%01d C  ", (uint16_t)(temp / 10), (uint16_t)(temp % 10));
 		BSP_LCD_DisplayStringAt(0, BSP_LCD_GetYSize()/2 + 95, msg, CENTER_MODE);
 		osDelay(200);
@@ -945,6 +979,15 @@ void StartDefaultTask(void const * argument)
  *  3    0x48
  *  4    0x51
  */
+/*
+ * Original value in word 02 : 0x5A 0x0D     0x46
+ *                             0x5A 00001101 01000110
+ *                                  000                - EEPROM lock
+ *                                     011             - communication address lock
+ *                                        01 01000     - address 7 bits
+ *                                                11   - diagnostic config
+ *                                                  0  - SPI clock polarity
+ */
 /* USER CODE END Header_StartTaskI2C */
 void StartTaskI2C(void const * argument)
 {
@@ -954,6 +997,7 @@ void StartTaskI2C(void const * argument)
 	const uint32_t I2C_Timeout = I2Cx_TIMEOUT_MAX;
 	const int nbAddress = 5;
 	const uint8_t address[5] = { 0x28, 0x36, 0x46, 0x48, 0x51 };
+	HAL_StatusTypeDef res;
 	uint8_t detected = 0;
 	uint8_t counted = 0;
 	uint8_t dataBuf[4];
@@ -1001,18 +1045,7 @@ void StartTaskI2C(void const * argument)
 					for (unsigned int i = 0; i < nbAddress; i++)
 					{
 						uint8_t d = address[i] << 1;
-						dataBuf[0] = 0xA0;
-						dataBuf[1] = 0;
-						dataBuf[2] = 0;
-						HAL_GPIO_WritePin(GPIOC, Sensor_PWR_Pin, GPIO_PIN_SET);
-						HAL_Delay(3);
-						HAL_I2C_Master_Transmit(&hi2c3, d, dataBuf, 3, I2C_Timeout);
-						dataBuf[0] = 2;
-						dataBuf[1] = 0;
-						dataBuf[2] = 0;
-						HAL_I2C_Master_Transmit(&hi2c3, d, dataBuf, 3, I2C_Timeout);
-						memset(dataBuf, 0, 3);
-						HAL_StatusTypeDef res = HAL_I2C_Master_Receive(&hi2c3, d | 1, dataBuf, 3, I2C_Timeout);
+						res = powerup_and_read(&hi2c3, d, dataBuf, I2C_Timeout);
 						HAL_GPIO_WritePin(GPIOC, Sensor_PWR_Pin, GPIO_PIN_RESET);
 						if (res == HAL_OK && dataBuf[0] == 0x5A)
 						{
@@ -1027,6 +1060,215 @@ void StartTaskI2C(void const * argument)
 						HAL_Delay(10);
 					}
 					my_printf("Scan completed - found %u device%s - flags 0x%02X\r\n# ", counted, counted > 1 ? "s" : "", detected);
+				}
+				else if (strncmp((char *) input, "set ", 4) == 0 && cmdLen == 6)
+				{
+					/* WARNING - writing bad data to the EEPROM can render the sensor unusable...  */
+					/*
+					 * From ZSC31014 datasheet
+					 *
+					 *  Command Byte    Third and                                                                    Processing
+					 * 8 Command Bits  Fourth Bytes    Description       Time ††
+					 *    (Hex)          16 Data                          4MHz/1MHz
+					 *                  Bits(Hex)
+					 * 00HEX to 13HEX  0000HEX       EEPROM Read of addresses 00HEX to 13HEX.
+					 *                               After this command has been sent and executed, a data
+					 *                               fetch of three bytes must be performed. The first byte will be     10μs
+					 *                               a response byte, which should be a 5AHEX, and then the next
+					 *                               two bytes will be the EEPROM data.
+					 * 40HEX to 53HEX  YYYYHEX       Write to EEPROM addresses 00HEX to 13HEX.
+					 *                 (Y= data)     If the command is an EEPROM write, then the 16 bits of             15ms
+					 *                               data sent will be written to the address specified in the 6
+					 *                               LSBs of the command byte.
+					 * 80HEX           0000HEX       Start_NOM => Ends Command Mode and transitions to
+					 *                               Normal Operation Mode. When a Start_NOM command is              15ms if EEPROM
+					 *                               executed, a flag is checked to see if EEPROM was                signature is
+					 *                               programmed during Command Mode. If so, the device will          updated;
+					 *                               regenerate the checksum and update the signature                10μs otherwise
+					 *                               EEPROM word.
+					 * A0HEX           0000HEX       Start_CM => Start Command Mode; used to enter
+					 *                               Command Mode. Start_CM is only valid during the power-on           10μs
+					 *                               command window.
+					 */
+					/* Set I2C address to new value */
+					int old = input[4] - '0';
+					int new = input[5] - '0';
+					if (old < 0 || old > 4 || new < 0 || new > 4 || (detected & (1 << old)) == 0)
+						my_printf("Something is wrong... old = %d, new = %d, detected = %d\r\n", old, new, detected);
+					else
+					{
+						uint8_t d = address[old] << 1;
+						res = powerup_and_read(&hi2c3, d, dataBuf, I2C_Timeout);
+						uint8_t a = (dataBuf[1] >> 2) & 3;
+						uint8_t b = ((dataBuf[1] & 3) << 5) | (dataBuf[2] >> 3);
+						my_printf("Got %d 0x%02X 0x%02X 0x%02X %u 0x%02X\r\n", res, dataBuf[0], dataBuf[1], dataBuf[2], a, b);
+						if (res == HAL_OK && dataBuf[0] == 0x5A)
+						{
+							dataBuf[0] = 0x42;
+							dataBuf[1] = 0x0C | (address[new] >> 5);
+							dataBuf[2] = 0x06 | ((address[new] << 3) & 0xff);
+							my_printf("Sending 0x%02X 0x%02X 0x%02X\r\n", dataBuf[0], dataBuf[1], dataBuf[2]);
+							res = HAL_I2C_Master_Transmit(&hi2c3, d, dataBuf, 3, I2C_Timeout);
+							my_printf("HAL res after send new address = %d\r\n", res);
+							HAL_Delay(15); // wait 15 ms according to DS
+							dataBuf[0] = 0x80;
+							dataBuf[1] = 0;
+							dataBuf[2] = 0;
+							res = HAL_I2C_Master_Transmit(&hi2c3, d, dataBuf, 3, I2C_Timeout);
+							my_printf("HAL res after send exit command mode = %d\r\n", res);
+							HAL_Delay(15); // wait another 15 ms to update EEPROM signature
+							osDelay(50);
+							HAL_GPIO_WritePin(GPIOC, Sensor_PWR_Pin, GPIO_PIN_RESET);
+							my_printf("Will now pause 10 seconds\r\n");
+							osDelay(10000);
+							HAL_GPIO_WritePin(GPIOC, Sensor_PWR_Pin, GPIO_PIN_SET);
+							HAL_Delay(10);
+							d = address[new] << 1;
+							memset(dataBuf,0,4);
+							res = HAL_I2C_Master_Receive(&hi2c3, d | 1, dataBuf, 4, I2C_Timeout);
+							my_printf("Retrieved 0x%02X 0x%02X 0x%02X 0x%02X %d with new address 0x%02X\r\n", dataBuf[0], dataBuf[1], dataBuf[2], dataBuf[3], res, address[new]);
+							osDelay(50);
+							memset(dataBuf,0,4);
+							res = HAL_I2C_Master_Receive(&hi2c3, d | 1, dataBuf, 4, I2C_Timeout);
+							my_printf("Retrieved 0x%02X 0x%02X 0x%02X 0x%02X %d with new address 0x%02X\r\n", dataBuf[0], dataBuf[1], dataBuf[2], dataBuf[3], res, address[new]);
+							if (res == HAL_OK)
+								my_printf("Set new I2C address completed successfully - 0x%02X -> 0x%02X\r\n", address[old], address[new]);
+							else
+								my_printf("Set new I2C address failed : %d\r\n", res);
+						} else {
+							my_printf("Power up check failed : %d 0x%02X 0x%02X 0x%02X %u 0x%02X\r\n", res, dataBuf[0], dataBuf[1], dataBuf[2], a, b);
+						}
+						HAL_GPIO_WritePin(GPIOC, Sensor_PWR_Pin, GPIO_PIN_RESET);
+						detected = 0;
+						counted = 0;
+					}
+					my_printf("# ");
+				}
+				else if (strncmp((char *) input, "reset", cmdLen) == 0)
+				{
+					/*
+					 * 3.2.10 General call address
+					 * 0000 0110 (06h) — Reset and write programmable part of slave address by hardware.
+					 * On receiving this 2-byte sequence, all devices designed to respond to the general call
+					 * address reset and take in the programmable part of their address.
+					 */
+					dataBuf[0] = 0x06;
+					HAL_GPIO_WritePin(GPIOC, Sensor_PWR_Pin, GPIO_PIN_SET);
+					HAL_Delay(3);
+					res = HAL_I2C_Master_Transmit(&hi2c3, 0, dataBuf, 1, I2C_Timeout);
+					HAL_Delay(10);
+					HAL_GPIO_WritePin(GPIOC, Sensor_PWR_Pin, GPIO_PIN_RESET);
+					my_printf("General call with reset done - res = %d\r\n# ", res);
+				}
+				else if (strncmp((char *) input, "read", cmdLen) == 0)
+				{
+					/* read EEPROM values */
+					uint8_t d = LCdev[0];
+					res = powerup_and_read(&hi2c3, d, dataBuf, I2C_Timeout);
+					uint8_t a = (dataBuf[1] >> 2) & 3;
+					uint8_t b = ((dataBuf[1] & 3) << 5) | (dataBuf[2] >> 3);
+					my_printf("Reading from 0x%02X\r\nGot %d 0x%02X 0x%02X 0x%02X %u 0x%02X\r\n", d >> 1, res, dataBuf[0], dataBuf[1], dataBuf[2], a, b);
+					if (res == HAL_OK && dataBuf[0] == 0x5A)
+					{
+						for (uint8_t a = 0; a < 0x14; a++)
+						{
+							res = read_cell(&hi2c3, d, a, dataBuf, I2C_Timeout);
+							my_printf(" 0x%02X : 0x%02X 0x%02X 0x%02X %d\r\n", a, dataBuf[0], dataBuf[1], dataBuf[2], res);
+							if (res != HAL_OK || dataBuf[0] != 0x5A)
+								break;
+						}
+					}
+					HAL_GPIO_WritePin(GPIOC, Sensor_PWR_Pin, GPIO_PIN_RESET);
+					my_printf("# ");
+				}
+				else if (strncmp((char *) input, "probe", cmdLen) == 0)
+				{
+					uint8_t d = LCdev[0];
+					my_printf("\nProbing twice\r\n");
+					HAL_GPIO_WritePin(GPIOC, Sensor_PWR_Pin, GPIO_PIN_SET);
+					HAL_Delay(10);
+					for (unsigned int i = 0; i < 4; i++)
+					{
+						memset(dataBuf,0,4);
+						res = HAL_I2C_Master_Receive(&hi2c3, d | 1, dataBuf, 4, I2C_Timeout);
+						my_printf("Read %d at 0x%02X (%d) :", i, d >> 1, res);
+						int status = dataBuf[0] >> 6;
+						int w = ((dataBuf[0] & 0x3f) << 8) | dataBuf[1];
+						int t = (dataBuf[2] << 3) | (dataBuf[3] >> 5);
+						my_printf(" status %u - weight %u temperature %u\r\n", status, w, t);
+						osDelay(1000);
+					}
+					HAL_GPIO_WritePin(GPIOC, Sensor_PWR_Pin, GPIO_PIN_RESET);
+					osDelay(50);
+					res = powerup_and_read(&hi2c3, d, dataBuf, I2C_Timeout);
+					uint8_t a = (dataBuf[1] >> 2) & 3;
+					uint8_t b = ((dataBuf[1] & 3) << 5) | (dataBuf[2] >> 3);
+					my_printf("Got %d 0x%02X 0x%02X 0x%02X %u 0x%02X\r\n", res, dataBuf[0], dataBuf[1], dataBuf[2], a, b);
+					if (res == HAL_OK && dataBuf[0] == 0x5A)
+					{
+						dataBuf[0] = 0x80;
+						dataBuf[1] = 0;
+						dataBuf[2] = 0;
+						res = HAL_I2C_Master_Transmit(&hi2c3, d, dataBuf, 3, I2C_Timeout);
+						my_printf("HAL res after send exit command mode = %d\r\n", res);
+						for (unsigned int i = 0; i < 4; i++)
+						{
+							memset(dataBuf,0,4);
+							res = HAL_I2C_Master_Receive(&hi2c3, d | 1, dataBuf, 4, I2C_Timeout);
+							my_printf("Read %d at 0x%02X (%d) :", i, d >> 1, res);
+							int status = dataBuf[0] >> 6;
+							int w = ((dataBuf[0] & 0x3f) << 8) | dataBuf[1];
+							int t = (dataBuf[2] << 3) | (dataBuf[3] >> 5);
+							my_printf(" status %u - weight %u temperature %u\r\n", status, w, t);
+							osDelay(1000);
+						}
+					}
+					HAL_GPIO_WritePin(GPIOC, Sensor_PWR_Pin, GPIO_PIN_RESET);
+					my_printf("# ");
+				}
+				else if (strncmp((char *) input, "ID", cmdLen) == 0)
+				{
+					/* does not seem to work on my device... */
+					/*
+					 * The Device ID is read-only, hard-wired in the device and can be accessed as follows:
+					 * 1. START condition
+					 * 2. The master sends the Reserved Device ID I2C-bus address followed by the R/W bit
+					 *    set to ‘0’ (write): ‘1111 1000’.
+					 * 3. The master sends the I2C-bus slave address of the slave device it must identify. The
+					 *    LSB is a ‘Don’t care’ value. Only one device must acknowledge this byte (the one that
+					 *    has the I2C-bus slave address).
+					 * 4. The master sends a Re-START condition.
+					 *    Remark: A STOP condition followed by a START condition resets the slave state
+					 *    machine and the Device ID Read cannot be performed. Also, a STOP condition or a
+					 *    Re-START condition followed by an access to another slave device resets the slave
+					 *    state machine and the Device ID Read cannot be performed.
+					 * 5. The master sends the Reserved Device ID I2C-bus address followed by the R/W bit
+					 *    set to ‘1’ (read): ‘1111 1001’.
+					 * 6. The Device ID Read can be done, starting with the 12 manufacturer bits (first byte +
+					 *    four MSBs of the second byte), followed by the nine part identification bits (four LSBs
+					 *    of the second byte + five MSBs of the third byte), and then the three die revision bits
+					 *    (three LSBs of the third byte).
+					 * 7. The master ends the reading sequence by NACKing the last byte, thus resetting the
+					 *    slave device state machine and allowing the master to send the STOP condition.
+					 */
+					my_printf("\nGetting Device ID\r\n");
+					HAL_GPIO_WritePin(GPIOC, Sensor_PWR_Pin, GPIO_PIN_SET);
+					HAL_Delay(10);
+					for (unsigned int i = 0; i < 5; i++)
+					{
+						int d = address[i] << 1;
+						memset(dataBuf,0,3);
+						res = HAL_I2C_Mem_Read(&hi2c3, 0xF8, d, 1, dataBuf, 3, I2C_Timeout);
+						my_printf("%u - 0x%02X : 0x%02X 0x%02X 0x%02X %d\r\n", i, d >> 1, dataBuf[0], dataBuf[1], dataBuf[2], res);
+						if (res == HAL_OK)
+						{
+							int m = (dataBuf[0] << 4) | (dataBuf[1] >> 4);
+							int p = ((int) dataBuf[1] << 5) | (dataBuf[2] >> 3);
+							my_printf("  Manufacturer %u (0x%03X) Part %u (0x%03X) Die revision %u\r\n", m, m, p, p, dataBuf[2] & 0x7);
+						}
+					}
+					HAL_GPIO_WritePin(GPIOC, Sensor_PWR_Pin, GPIO_PIN_RESET);
+					my_printf("# ");
 				}
 				else
 					my_printf("Unknown command\r\n# ");
@@ -1091,6 +1333,7 @@ void readI2C(void const * argument)
 			//  currently alternates between stale and valid data
 			for (unsigned int i = 0; i < LCcnt; i++)
 			{
+				memset(dataBuf, 0, 4);
 				res = HAL_I2C_Master_Receive(&hi2c3, LCdev[i] | 1, dataBuf, 4, I2C_Timeout);
 				if (res != HAL_OK)
 					errs += 1;
@@ -1103,6 +1346,8 @@ void readI2C(void const * argument)
 						memcpy(bridgeValue + i * 4, dataBuf, 4);
 					} else if (status == 2)
 						stale += 1;
+					else
+						bridgeValue[3] = status;
 				}
 			}
 			osDelay(50);
